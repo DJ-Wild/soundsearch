@@ -1,0 +1,280 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import type { Request, Response, NextFunction, Express } from 'express';
+import { db_get_user, db_save_user, getDb } from './db';
+
+// All identity and ownership decisions are made on the server, never from user_id in a request.
+const SESSION_COOKIE = 'ss_session';
+const OIDC_COOKIE = 'ss_oidc_state';
+const SESSION_SECONDS = 30 * 24 * 60 * 60;
+const OIDC_SECONDS = 10 * 60;
+const ISSUER = 'https://oauth.telegram.org';
+const OIDC_BASE = 'https://oauth.telegram.org';
+// Open registration: any correctly verified Telegram user may sign in.
+// ADMIN_ID grants an admin role, but is NEVER an authentication allowlist.
+const adminId = Number(process.env.ADMIN_ID || '0');
+const isAdmin = (id: number) => Number.isSafeInteger(adminId) && adminId > 0 && id === adminId;
+const oidcPending = new Map<string, { verifier: string; createdAt: number }>();
+let jwksCache: { expiresAt: number; keys: any[] } | null = null;
+
+export interface AuthenticatedRequest extends Request {
+  authUser?: { id: number; first_name?: string; username?: string };
+}
+
+const publicUrl = () => {
+  const value = process.env.APP_URL;
+  if (!value) throw new Error('APP_URL is required for Telegram OIDC');
+  const url = new URL(value);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) {
+    throw new Error('APP_URL must use HTTPS');
+  }
+  return url;
+};
+const isSecure = () => publicUrl().protocol === 'https:';
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+const sha256hex = (raw: string) => crypto.createHash('sha256').update(raw).digest('hex');
+const cookieOptions = () => ({ httpOnly: true as const, secure: isSecure(), sameSite: 'lax' as const, path: '/' });
+const validTelegramId = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+
+function cookie(req: Request, name: string): string | undefined {
+  const value = req.headers.cookie || '';
+  const part = value.split(';').map(v => v.trim()).find(v => v.startsWith(`${name}=`));
+  if (!part) return undefined;
+  try { return decodeURIComponent(part.slice(name.length + 1)); } catch { return undefined; }
+}
+
+function oidcCallbackUrl(): string {
+  return new URL('/api/auth/telegram/callback', publicUrl().origin).toString();
+}
+function validSameOrigin(req: Request): boolean {
+  const origin = req.get('Origin');
+  if (origin) {
+    try { return new URL(origin).origin === publicUrl().origin; } catch { return false; }
+  }
+  const fetchSite = req.get('Sec-Fetch-Site');
+  return !fetchSite || fetchSite === 'same-origin' || fetchSite === 'none';
+}
+
+export function checkRequestOrigin(req: Request, res: Response, next: NextFunction) {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !validSameOrigin(req)) {
+    res.status(403).json({ error: 'Недопустимый источник запроса' });
+    return;
+  }
+  next();
+}
+
+function createSession(res: Response, userId: number) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = nowSeconds() + SESSION_SECONDS;
+  getDb().prepare('DELETE FROM web_sessions WHERE expires_at <= ?').run(nowSeconds());
+  getDb().prepare('INSERT INTO web_sessions (session_hash, user_id, expires_at) VALUES (?, ?, ?)')
+    .run(sha256hex(token), userId, expiresAt);
+  res.cookie(SESSION_COOKIE, token, { ...cookieOptions(), maxAge: SESSION_SECONDS * 1000 });
+}
+
+function readSession(req: Request) {
+  const token = cookie(req, SESSION_COOKIE);
+  if (!token || !/^[a-zA-Z0-9_-]{40,100}$/.test(token)) return null;
+  const hash = sha256hex(token);
+  const row = getDb().prepare('SELECT user_id, expires_at FROM web_sessions WHERE session_hash = ?')
+    .get(hash) as { user_id: number; expires_at: number } | undefined;
+  if (!row) return null;
+  if (row.expires_at <= nowSeconds()) {
+    getDb().prepare('DELETE FROM web_sessions WHERE session_hash = ?').run(hash);
+    return null;
+  }
+  const user = db_get_user(row.user_id);
+  return user ? { ...user, is_admin: isAdmin(user.id) } : null;
+}
+
+export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const user = readSession(req);
+  if (!user) {
+    res.status(401).json({ error: 'Требуется авторизация через Telegram' });
+    return;
+  }
+  req.authUser = user;
+  next();
+}
+
+// Use this middleware for future admin-only API endpoints.
+// Checking the role only in the React UI is NOT sufficient authorization.
+export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  requireAuth(req, res, () => {
+    if (!req.authUser || !isAdmin(req.authUser.id)) {
+      res.status(403).json({ error: 'Доступ разрешён только администратору' });
+      return;
+    }
+    next();
+  });
+}
+
+function verifyMiniAppInitData(raw: string, botToken: string) {
+  if (!raw || raw.length > 16384 || !botToken || botToken === 'MY_BOT_TOKEN') return null;
+  const params = new URLSearchParams(raw);
+  const hash = params.get('hash');
+  const authDate = Number(params.get('auth_date'));
+  if (!hash || !/^[a-f0-9]{64}$/i.test(hash) || !Number.isInteger(authDate) ||
+      authDate > nowSeconds() + 60 || authDate < nowSeconds() - 86400) return null;
+  params.delete('hash');
+  const values: string[] = [];
+  params.forEach((value, key) => { values.push(`${key}=${value}`); });
+  values.sort();
+  const secret = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+  const expected = crypto.createHmac('sha256', secret).update(values.join('\n')).digest();
+  const actual = Buffer.from(hash, 'hex');
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const user = JSON.parse(params.get('user') || 'null');
+    return validTelegramId(user?.id) ? user : null;
+  } catch { return null; }
+}
+
+async function loadJwks() {
+  if (jwksCache && jwksCache.expiresAt > Date.now()) return jwksCache.keys;
+  const response = await fetch(`${OIDC_BASE}/.well-known/jwks.json`, { signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw new Error('Telegram JWKS unavailable');
+  const data = await response.json() as { keys?: any[] };
+  if (!Array.isArray(data.keys)) throw new Error('Invalid JWKS');
+  jwksCache = { keys: data.keys, expiresAt: Date.now() + 10 * 60 * 1000 };
+  return data.keys;
+}
+
+async function verifyIdToken(idToken: string, clientId: string) {
+  const parts = idToken.split('.');
+  if (parts.length !== 3 || parts.some(p => p.length > 16000)) throw new Error('Malformed Telegram ID token');
+  const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+  const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  // Default Telegram OIDC algorithm; configure RS256 in BotFather > Login Widget > Advanced.
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string') throw new Error('Unsupported Telegram signing key');
+  const keys = await loadJwks();
+  const key = keys.find(k => k.kid === header.kid && k.kty === 'RSA' && (!k.alg || k.alg === 'RS256') && (!k.use || k.use === 'sig'));
+  if (!key) throw new Error('Telegram signing key not found');
+  const verified = crypto.verify('RSA-SHA256', Buffer.from(`${parts[0]}.${parts[1]}`),
+    crypto.createPublicKey({ key, format: 'jwk' }), Buffer.from(parts[2], 'base64url'));
+  if (!verified) throw new Error('Invalid Telegram signature');
+  const time = nowSeconds();
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  const rawId: unknown = claims.id;
+  const telegramId: unknown =
+    typeof rawId === 'string' && /^[1-9][0-9]*$/.test(rawId)
+      ? Number(rawId) : rawId;
+
+  const invalid: string[] = [];
+
+  if (claims.iss !== ISSUER) invalid.push('iss');
+  if (!audiences.some((a: unknown) =>
+    (typeof a === 'string' || typeof a === 'number') &&
+    String(a) === clientId)) invalid.push('aud');
+  if (!Number.isInteger(claims.exp) || claims.exp <= time) invalid.push('exp');
+  if (!Number.isInteger(claims.iat) || claims.iat > time + 60) invalid.push('iat');
+  if (claims.nbf !== undefined &&
+      (!Number.isInteger(claims.nbf) || claims.nbf > time)) invalid.push('nbf');
+  if (typeof claims.sub !== 'string' || !claims.sub) invalid.push('sub');
+  if (!validTelegramId(telegramId)) invalid.push('id');
+
+  if (invalid.length)
+    throw new Error('Invalid Telegram identity claims: ' + invalid.join(', '));
+
+  return { ...claims, id: telegramId as number };
+}
+
+export function registerAuthRoutes(app: Express) {
+  app.get('/api/auth/session', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const user = readSession(req);
+    res.json({ authenticated: Boolean(user), user: user || null });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const token = cookie(req, SESSION_COOKIE);
+    if (token) getDb().prepare('DELETE FROM web_sessions WHERE session_hash = ?').run(sha256hex(token));
+    res.clearCookie(SESSION_COOKIE, cookieOptions());
+    res.json({ success: true });
+  });
+
+  app.post('/api/auth/telegram-initdata', (req, res) => {
+    const initData = req.body?.initData;
+    if (typeof initData !== 'string') { res.status(400).json({ error: 'Отсутствует Telegram initData' }); return; }
+    const user = verifyMiniAppInitData(initData, process.env.BOT_TOKEN || '');
+    if (!user) { res.status(401).json({ error: 'Не удалось подтвердить личность через Telegram' }); return; }
+    const profile = {
+      id: user.id, first_name: String(user.first_name || 'Пользователь').slice(0, 100),
+      last_name: String(user.last_name || '').slice(0, 100),
+      username: String(user.username || '').slice(0, 100),
+      photo_url: String(user.photo_url || '').slice(0, 2048), auth_date: nowSeconds(),
+    };
+    db_save_user(profile);
+    createSession(res, user.id);
+    res.json({ success: true, user: { ...profile, is_admin: isAdmin(user.id) } });
+  });
+
+  app.get('/api/auth/telegram/start', (req, res) => {
+    try {
+      const clientId = process.env.TELEGRAM_CLIENT_ID;
+      if (!clientId || !process.env.TELEGRAM_CLIENT_SECRET) {
+        res.status(503).send('Telegram Login не настроен. Укажите TELEGRAM_CLIENT_ID и TELEGRAM_CLIENT_SECRET.');
+        return;
+      }
+      const state = crypto.randomBytes(24).toString('base64url');
+      const verifier = crypto.randomBytes(48).toString('base64url');
+      // Opportunistic expiry cleanup; restart invalidates pending logins, not active sessions.
+      for (const [key, item] of oidcPending) if (Date.now() - item.createdAt > OIDC_SECONDS * 1000) oidcPending.delete(key);
+      oidcPending.set(state, { verifier, createdAt: Date.now() });
+      res.cookie(OIDC_COOKIE, state, { ...cookieOptions(), path: '/api/auth/telegram/callback', maxAge: OIDC_SECONDS * 1000 });
+      const uri = new URL(`${OIDC_BASE}/auth`);
+      uri.searchParams.set('client_id', clientId);
+      uri.searchParams.set('redirect_uri', oidcCallbackUrl());
+      uri.searchParams.set('response_type', 'code');
+      uri.searchParams.set('scope', 'openid profile');
+      uri.searchParams.set('state', state);
+      uri.searchParams.set('code_challenge', crypto.createHash('sha256').update(verifier).digest('base64url'));
+      uri.searchParams.set('code_challenge_method', 'S256');
+      res.setHeader('Cache-Control', 'no-store');
+      res.redirect(302, uri.toString());
+    } catch (err) { console.error('Telegram OIDC start:', err); res.status(503).send('Ошибка конфигурации Telegram Login'); }
+  });
+
+  app.get('/api/auth/telegram/callback', async (req, res) => {
+    const finish = (result: 'success' | 'denied' | 'error') => res.redirect(303, `/?auth=${result}`);
+    const state = req.query.state;
+    const code = req.query.code;
+    const storedState = cookie(req, OIDC_COOKIE);
+    res.clearCookie(OIDC_COOKIE, { ...cookieOptions(), path: '/api/auth/telegram/callback' });
+    if (typeof state !== 'string' || !storedState || state !== storedState) { finish('error'); return; }
+    const pending = oidcPending.get(state);
+    oidcPending.delete(state); // one-time state
+    if (!pending || Date.now() - pending.createdAt > OIDC_SECONDS * 1000) { finish('error'); return; }
+    if (typeof code !== 'string' || !code || code.length > 4096) { finish('error'); return; }
+    try {
+      const clientId = process.env.TELEGRAM_CLIENT_ID || '';
+      const secret = process.env.TELEGRAM_CLIENT_SECRET || '';
+      const payload = new URLSearchParams({
+        grant_type: 'authorization_code', code, redirect_uri: oidcCallbackUrl(),
+        client_id: clientId, code_verifier: pending.verifier,
+      });
+      const tokenResponse = await fetch(`${OIDC_BASE}/token`, {
+        method: 'POST', signal: AbortSignal.timeout(12000),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${Buffer.from(`${clientId}:${secret}`).toString('base64')}` },
+        body: payload,
+      });
+      if (!tokenResponse.ok) throw new Error(`Telegram token exchange failed: ${tokenResponse.status}`);
+      const tokenData = await tokenResponse.json() as { id_token?: string };
+      if (typeof tokenData.id_token !== 'string') throw new Error('Missing Telegram ID token');
+      const verified = await verifyIdToken(tokenData.id_token, clientId);
+      db_save_user({
+        id: verified.id, first_name: String(verified.given_name || verified.name || 'Пользователь').slice(0, 100),
+        last_name: String(verified.family_name || '').slice(0, 100),
+        username: String(verified.preferred_username || '').slice(0, 100),
+        photo_url: String(verified.picture || '').slice(0, 2048), auth_date: nowSeconds(),
+      });
+      createSession(res, verified.id);
+      finish('success');
+    } catch (err) {
+      console.error('Telegram OIDC callback:', err);
+      finish('error');
+    }
+  });
+}
