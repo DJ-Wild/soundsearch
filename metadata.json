@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Music Bot Mini App",
+  "description": "Telegram Mini App для поиска, скачивания музыки и отправки треков прямо в чат Telegram с историей и избранным.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
