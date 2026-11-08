@@ -22,6 +22,8 @@ interface FavoritesTabProps {
   onPlayToggle: (track: Track, queue?: Track[]) => void;
   onGoToSearch: () => void;
   triggerHaptic: (type?: any) => void;
+  isLoggedIn?: boolean;
+  onOpenLogin?: () => void;
 }
 
 export const FavoritesTab: React.FC<FavoritesTabProps> = ({
@@ -32,9 +34,48 @@ export const FavoritesTab: React.FC<FavoritesTabProps> = ({
   onPlayToggle,
   onGoToSearch,
   triggerHaptic,
+  isLoggedIn = true,
+  onOpenLogin,
 }) => {
   const [filterQuery, setFilterQuery] = useState('');
   const [sendingId, setSendingId] = useState<string | number | null>(null);
+
+  if (!isLoggedIn) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6 pb-24 animate-fade-in">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base md:text-lg font-bold text-white flex items-center gap-2 drop-shadow-xs">
+              <Heart className="w-5 h-5 text-rose-500 fill-rose-500" />
+              Любимые треки
+            </h2>
+            <p className="text-xs md:text-sm text-zinc-300 mt-0.5">
+              Сохраненная музыка вашего аккаунта
+            </p>
+          </div>
+        </div>
+
+        <div className="text-center py-16 px-6 rounded-3xl bg-white/[0.05] backdrop-blur-2xl border border-white/15 flex flex-col items-center shadow-2xl">
+          <div className="w-16 h-16 rounded-3xl bg-rose-500/15 border border-rose-500/25 flex items-center justify-center text-rose-400 mb-4 shadow-lg shadow-rose-500/10">
+            <Heart className="w-8 h-8 fill-rose-500/40" />
+          </div>
+          <h3 className="text-lg md:text-xl font-extrabold text-white">
+            Войдите через Telegram
+          </h3>
+          <p className="text-xs md:text-sm text-zinc-300 max-w-sm mt-2 mb-6 leading-relaxed">
+            Чтобы сохранять любимые треки и иметь к ним доступ с любого устройства, войдите через Telegram.
+          </p>
+          <button
+            onClick={onOpenLogin}
+            className="px-6 py-3 rounded-full bg-[#24A1DE] hover:bg-[#1F93CC] text-white font-bold text-xs md:text-sm transition-all shadow-lg shadow-sky-500/25 active:scale-95 flex items-center gap-2 cursor-pointer"
+          >
+            <Send className="w-4 h-4 fill-white text-white -rotate-12" />
+            <span>Войти через Telegram</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const filtered = favorites.filter((f) => {
     if (!filterQuery.trim()) return true;

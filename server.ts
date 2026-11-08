@@ -1,13 +1,25 @@
 import express, { Request, Response } from 'express';
+import compression from 'compression';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { initDb, db_add_favorite, db_remove_favorite, db_get_favorites, db_remove_history, db_clear_history, db_get_history } from './src/server/db';
+import {
+  initDb,
+  db_add_favorite,
+  db_remove_favorite,
+  db_get_favorites,
+  db_remove_history,
+  db_clear_history,
+  db_get_history,
+} from './src/server/db';
 import { searchTracks, resolveTrackByUrl, sendTrackToTelegram, streamAudioPipe } from './src/server/musicService';
+import { getSourceAudioQuality } from './src/server/audioQuality';
 import { paginateResults } from './src/utils/musicLogic';
 import { Platform, Track } from './src/types/music';
 import { registerAuthRoutes, requireAuth, checkRequestOrigin, AuthenticatedRequest } from './src/server/auth';
+import { initContentTable } from './src/server/contentDb';
+import { contentRouter } from './src/server/contentRoutes';
 
 dotenv.config();
 
@@ -20,44 +32,83 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 // Initialize SQLite database
 initDb();
+initContentTable();
 
+app.use(compression());
 app.use(express.json());
 
-// API: Get bot configuration and connection status
+let cachedBotInfo: { username: string; firstName: string; timestamp: number } | null = null;
+const BOT_INFO_CACHE_TTL = 10 * 60 * 1000;
+
 app.get('/api/config', async (req: Request, res: Response) => {
   const botToken = process.env.BOT_TOKEN;
   const hasBotToken = Boolean(botToken && botToken !== 'MY_BOT_TOKEN');
 
-  let botInfo: any = null;
-  if (hasBotToken) {
-    try {
-      const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
-      const tgData = (await tgRes.json()) as any;
-      if (tgData.ok) {
-        botInfo = {
-          username: tgData.result?.username,
-          firstName: tgData.result?.first_name,
-        };
+  let botUsername = 'music_telegram_bot';
+  let botFirstName = 'Music Bot';
+
+  if (hasBotToken && botToken) {
+    if (cachedBotInfo && Date.now() - cachedBotInfo.timestamp < BOT_INFO_CACHE_TTL) {
+      botUsername = cachedBotInfo.username;
+      botFirstName = cachedBotInfo.firstName;
+    } else {
+      try {
+        const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, {
+          signal: AbortSignal.timeout(3000),
+        });
+        const tgData = (await tgRes.json()) as any;
+        if (tgData.ok && tgData.result) {
+          botUsername = tgData.result.username || botUsername;
+          botFirstName = tgData.result.first_name || botFirstName;
+          cachedBotInfo = {
+            username: botUsername,
+            firstName: botFirstName,
+            timestamp: Date.now(),
+          };
+        }
+      } catch (e) {
+        console.warn('Telegram getMe timeout or error (using fallback):', e);
       }
-    } catch (e) {
-      console.warn('Telegram getMe error:', e);
     }
   }
 
+  res.setHeader('Cache-Control', 'public, max-age=60');
   res.json({
     hasBotToken,
-    botUsername: botInfo?.username || 'music_telegram_bot',
-    botFirstName: botInfo?.firstName || 'Music Bot',
+    botUsername,
+    botFirstName,
     appUrl: process.env.APP_URL || '',
   });
 });
 
-// Strict server-side authentication for both browser OIDC and Telegram Mini App.
+app.use('/api/v1/content', contentRouter);
+
 app.use('/api', checkRequestOrigin);
 registerAuthRoutes(app);
-app.use('/api', requireAuth);
 
-// API: Search tracks (matches python bot search_tracks & render_search_page)
+// Authenticated routes
+app.use('/api/favorites', requireAuth);
+app.use('/api/history', requireAuth);
+app.use('/api/download-track', requireAuth);
+app.use('/api/test-telegram', requireAuth);
+
+// API: Определение оригинального качества и битрейта источника
+app.get('/api/audio-quality', async (req: Request, res: Response) => {
+  try {
+    const { platform, url } = req.query as { platform?: Platform; url?: string };
+    if (!platform || !url) {
+      res.status(400).json({ status: 'unknown', reason: 'Укажите platform и url' });
+      return;
+    }
+    const quality = await getSourceAudioQuality(platform, url);
+    res.setHeader('Cache-Control', 'public, max-age=600');
+    res.json(quality);
+  } catch (err: any) {
+    res.status(500).json({ status: 'unknown', reason: err?.message || 'Ошибка проверки качества' });
+  }
+});
+
+// API: Search tracks
 app.post('/api/search', async (req: Request, res: Response) => {
   try {
     const { query, platform = 'youtube', page = 0 } = req.body;
@@ -97,7 +148,7 @@ app.post('/api/search', async (req: Request, res: Response) => {
   }
 });
 
-// API: Resolve track metadata from link (matches python ask_platform_for_download)
+// API: Resolve track metadata from link
 app.post('/api/resolve-url', async (req: Request, res: Response) => {
   try {
     const { url, platform } = req.body;
@@ -114,11 +165,10 @@ app.post('/api/resolve-url', async (req: Request, res: Response) => {
   }
 });
 
-// API: Download track & send to Telegram chat (matches python execute_download)
+// API: Download track & send to Telegram chat
 app.post('/api/download-track', async (req: Request, res: Response) => {
   try {
     const { url, platform = 'youtube', title, artist, preview_url, thumbnail, duration } = req.body;
-
     const targetChatId = (req as AuthenticatedRequest).authUser!.id;
 
     let track: Track = {
@@ -131,7 +181,6 @@ app.post('/api/download-track', async (req: Request, res: Response) => {
       duration: duration ? Number(duration) : undefined,
     };
 
-    // If url provided without title, resolve first
     if ((!title || !artist) && url) {
       const resolved = await resolveTrackByUrl(url, platform as Platform);
       track = {
@@ -144,7 +193,6 @@ app.post('/api/download-track', async (req: Request, res: Response) => {
     }
 
     const sendResult = await sendTrackToTelegram(targetChatId, track);
-
     res.json(sendResult);
   } catch (err: any) {
     console.error('Download and send error:', err);
@@ -152,7 +200,7 @@ app.post('/api/download-track', async (req: Request, res: Response) => {
   }
 });
 
-// API: Favorites (matches python db_get_favorites, db_add_favorite, db_remove_favorite)
+// API: Favorites
 app.get('/api/favorites', (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).authUser!.id;
   const favs = db_get_favorites(userId);
@@ -184,7 +232,7 @@ app.delete('/api/favorites/:id', (req: Request, res: Response) => {
   res.json({ success: ok });
 });
 
-// API: History (matches python db_get_history, db_remove_history)
+// API: History
 app.get('/api/history', (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).authUser!.id;
   const hist = db_get_history(userId, 50);
@@ -217,7 +265,7 @@ app.post('/api/test-telegram', async (req: Request, res: Response) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id,
-        text: '👋 *Привет из Telegram Mini App!*\nСвязь с ботом успешно проверена. Теперь вы можете искать треки и скачивать их прямо сюда!',
+        text: '👋 *Привет из Telegram Mini App!*\nСвязь с ботом успешно проверена.',
         parse_mode: 'Markdown',
       }),
     });
@@ -232,7 +280,7 @@ app.post('/api/test-telegram', async (req: Request, res: Response) => {
   }
 });
 
-// API: Stream audio (low-memory streaming with byte range / FFmpeg pipe support)
+// API: Stream audio
 app.get('/api/stream-audio', async (req: Request, res: Response) => {
   try {
     const { url, title, artist, duration } = req.query as Record<string, string>;
@@ -248,12 +296,10 @@ app.get('/api/stream-audio', async (req: Request, res: Response) => {
   }
 });
 
-// 404 Handler for API routes - Ensures all /api/* requests return JSON, never HTML
 app.use('/api/*', (req: Request, res: Response) => {
   res.status(404).json({ error: `API route ${req.originalUrl} не найден` });
 });
 
-// Mount Vite or serve static
 async function startServer() {
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');

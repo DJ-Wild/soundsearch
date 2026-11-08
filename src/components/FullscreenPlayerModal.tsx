@@ -13,9 +13,9 @@ import {
   ExternalLink,
   Loader2,
   Check,
-  Sparkles,
+  Activity,
 } from 'lucide-react';
-import { Track } from '../types/music';
+import { Track, SourceQuality } from '../types/music';
 import { formatDuration, getPlatformMeta } from '../utils/musicLogic';
 import { AudioVisualizer } from './AudioVisualizer';
 
@@ -66,8 +66,8 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
   const [isAppearing, setIsAppearing] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [justSent, setJustSent] = useState(false);
+  const [quality, setQuality] = useState<SourceQuality | null>(track?.quality || null);
 
-  // Smooth entrance & exit lifecycle
   useEffect(() => {
     let animId: number;
     if (isOpen) {
@@ -87,6 +87,33 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
     };
   }, [isOpen]);
 
+  // Загрузка качества текущего трека
+  useEffect(() => {
+    if (!track?.url) {
+      setQuality(null);
+      return;
+    }
+    setQuality(track.quality || null);
+    let alive = true;
+    const fetchQuality = async () => {
+      try {
+        const res = await fetch(
+          `/api/audio-quality?platform=${encodeURIComponent(track.platform)}&url=${encodeURIComponent(track.url)}`
+        );
+        if (res.ok) {
+          const data = (await res.json()) as SourceQuality;
+          if (alive && data.status === 'ok') {
+            setQuality(data);
+          }
+        }
+      } catch {}
+    };
+    fetchQuality();
+    return () => {
+      alive = false;
+    };
+  }, [track?.url, track?.platform, track?.quality]);
+
   const handleSmoothClose = useCallback(() => {
     if (isClosing) return;
     setIsClosing(true);
@@ -103,7 +130,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
 
   const meta = getPlatformMeta(track.platform);
 
-  // Swipe-down gesture detection on mobile
   const handleTouchStart = (e: React.TouchEvent) => {
     if (isClosing) return;
     setTouchStartY(e.touches[0].clientY);
@@ -115,7 +141,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
     const currentY = e.touches[0].clientY;
     const diff = currentY - touchStartY;
     if (diff > 0) {
-      // 1:1 tactile downward tracking
       setDragOffsetY(diff);
     } else {
       setDragOffsetY(0);
@@ -167,16 +192,9 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
     }
   };
 
-  const safeDuration =
-    duration && !isNaN(duration) && duration > 0 ? duration : track.duration || 180;
-  const progressPercent = Math.min(100, Math.max(0, (currentTime / safeDuration) * 100));
-
+  const safeDuration = duration && !isNaN(duration) && duration > 0 ? duration : track.duration || 180;
   const dragProgress = Math.min(1, Math.max(0, dragOffsetY / 350));
-  const backdropOpacity = isClosing
-    ? 0
-    : isAppearing
-    ? 0
-    : Math.max(0.1, 1 - dragProgress * 0.75);
+  const backdropOpacity = isClosing ? 0 : isAppearing ? 0 : Math.max(0.1, 1 - dragProgress * 0.75);
 
   let translateY = '0px';
   if (isClosing || isAppearing) {
@@ -205,8 +223,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
-      {/* Real-time Oscilloscope Audio Visualizer running across full screen behind player modal */}
-      {/* Matches user sketch in image_b13299f9.png (Silver/grey dynamic wave moving to sound) */}
       <div className="absolute inset-0 z-0 pointer-events-none flex items-center justify-center overflow-hidden">
         <AudioVisualizer
           audioElement={audioElement}
@@ -219,7 +235,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
         />
       </div>
 
-      {/* Ambient background mesh glows for Liquid Glass depth */}
       <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl pointer-events-none animate-pulse" />
       <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl pointer-events-none" />
 
@@ -231,7 +246,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
         }}
         className="w-full max-w-md md:max-w-3xl md:h-[82vh] h-[95vh] sm:h-[90vh] bg-zinc-950/75 backdrop-blur-2xl border border-white/20 rounded-t-[38px] md:rounded-[44px] p-6 md:p-8 flex flex-col justify-between shadow-[inset_0_1.5px_2px_rgba(255,255,255,0.3),0_25px_60px_rgba(0,0,0,0.85),0_0_35px_rgba(255,255,255,0.06)] overflow-y-auto no-scrollbar relative z-10"
       >
-        {/* In-Card Bright Dynamic Audio Visualizer (Vivid and smooth on both mobile & PC) */}
         <div className="absolute inset-0 z-0 pointer-events-none opacity-90 overflow-hidden">
           <AudioVisualizer
             audioElement={audioElement}
@@ -243,9 +257,9 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
             sensitivity={1.15}
           />
         </div>
-        {/* Top Header: Swipe handle / Platform indicator + Close 'X' button */}
+
+        {/* Top Header */}
         <div className="flex items-center justify-between relative z-10 pt-1 pb-2">
-          {/* Mobile swipe indicator handle with smooth dark gradient */}
           <div className="md:hidden absolute left-1/2 -translate-x-1/2 top-0 w-12 h-1 rounded-full bg-gradient-to-r from-zinc-700 via-zinc-500 to-zinc-700" />
 
           <div className="flex items-center gap-2">
@@ -254,6 +268,14 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
             >
               {meta.name}
             </span>
+
+            {quality && quality.status === 'ok' && quality.codec && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-[10px] font-mono font-bold text-emerald-300 border border-emerald-500/35 shadow-xs">
+                <Activity className="w-3 h-3" />
+                {quality.codec} {quality.bitrateKbps ? `${quality.bitrateKbps} kbps` : ''}
+              </span>
+            )}
+
             {isPlaying && (
               <span className="hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-white/10 text-[10px] font-semibold text-emerald-300 border border-white/15">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
@@ -262,7 +284,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
             )}
           </div>
 
-          {/* Close button with liquid glass effect */}
           <button
             onClick={handleSmoothClose}
             className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 border border-white/15 text-zinc-300 hover:text-white flex items-center justify-center transition-all active:scale-95 shadow-md"
@@ -272,9 +293,8 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
           </button>
         </div>
 
-        {/* Content Section: responsive split layout for PC (Desktop), column for Mobile */}
+        {/* Content Section */}
         <div className="flex flex-col md:flex-row md:items-center md:gap-10 my-auto py-2 relative z-10">
-          {/* Large Album Artwork with Liquid Glass Frame & Reflection */}
           <div className="flex flex-col items-center justify-center shrink-0">
             <div className="relative w-64 h-64 sm:w-72 sm:h-72 md:w-80 md:h-80 rounded-[32px] overflow-hidden bg-zinc-900/80 border border-white/20 shadow-[inset_0_1px_2px_rgba(255,255,255,0.4),0_20px_50px_rgba(0,0,0,0.85)] group">
               {track.thumbnail ? (
@@ -284,19 +304,14 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
                   className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
                 />
               ) : (
-                <div
-                  className={`w-full h-full bg-gradient-to-tr ${meta.gradient} flex items-center justify-center`}
-                >
+                <div className={`w-full h-full bg-gradient-to-tr ${meta.gradient} flex items-center justify-center`}>
                   <Music className="w-24 h-24 text-white/90" />
                 </div>
               )}
-
-              {/* Glossy specular top gradient */}
               <div className="absolute inset-0 bg-gradient-to-b from-white/20 via-transparent to-black/50 pointer-events-none" />
             </div>
           </div>
 
-          {/* Track Info & Interactive Details (Desktop right column / Mobile center) */}
           <div className="flex-1 min-w-0 flex flex-col justify-center mt-4 md:mt-0 px-2 md:px-0">
             <div className="flex items-center justify-between gap-3 mb-4">
               <div className="text-left flex-1 min-w-0">
@@ -314,7 +329,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
                 </p>
               </div>
 
-              {/* Favorite Heart Button with Liquid Glass Accent */}
               <button
                 onClick={() => {
                   triggerHaptic('selection');
@@ -327,15 +341,11 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
                 }`}
                 aria-label={isFavorite ? 'Убрать из любимых' : 'В любимые'}
               >
-                <Heart
-                  className={`w-6 h-6 ${
-                    isFavorite ? 'fill-rose-500 stroke-rose-500' : ''
-                  }`}
-                />
+                <Heart className={`w-6 h-6 ${isFavorite ? 'fill-rose-500 stroke-rose-500' : ''}`} />
               </button>
             </div>
 
-            {/* Timeline Progress Scrubber with Liquid Glow */}
+            {/* Timeline Progress Scrubber */}
             <div className="flex flex-col gap-2 mb-6">
               <div className="relative flex items-center">
                 <input
@@ -355,19 +365,17 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
               </div>
             </div>
 
-            {/* Playback Controls (Matching user specification: Left pill, Center circle, Right pill) */}
+            {/* Playback Controls */}
             <div className="flex items-center justify-center gap-4 sm:gap-6 mb-4">
-              {/* Left Button: Rewind / Previous track */}
               <button
                 onClick={handleLeftButton}
                 className="w-24 h-14 md:w-28 md:h-15 rounded-2xl bg-white/10 hover:bg-white/20 border border-white/15 active:scale-95 text-zinc-200 hover:text-white flex items-center justify-center transition-all shadow-lg backdrop-blur-md"
-                title="Перемотать в начало / Предыдущий трек"
+                title="В начало / Предыдущий трек"
                 aria-label="Предыдущий трек"
               >
                 <SkipBack className="w-6 h-6 fill-current" />
               </button>
 
-              {/* Center Button: Circular Play / Pause */}
               <button
                 onClick={handleCenterButton}
                 className="w-18 h-18 md:w-20 md:h-20 rounded-full bg-gradient-to-b from-white to-zinc-200 hover:from-white hover:to-white text-zinc-950 flex items-center justify-center active:scale-90 transition-transform shadow-[0_8px_25px_rgba(255,255,255,0.35)]"
@@ -381,7 +389,6 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
                 )}
               </button>
 
-              {/* Right Button: Next track */}
               <button
                 onClick={handleRightButton}
                 className="w-24 h-14 md:w-28 md:h-15 rounded-2xl bg-white/10 hover:bg-white/20 border border-white/15 active:scale-95 text-zinc-200 hover:text-white flex items-center justify-center transition-all shadow-lg backdrop-blur-md"
@@ -394,7 +401,7 @@ export const FullscreenPlayerModal: React.FC<FullscreenPlayerModalProps> = ({
           </div>
         </div>
 
-        {/* Bottom Actions: Send to Telegram & Source Link */}
+        {/* Bottom Actions */}
         <div className="flex items-center gap-2 pt-2 border-t border-white/10 relative z-10">
           <button
             onClick={handleSend}

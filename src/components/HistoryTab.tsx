@@ -27,6 +27,8 @@ interface HistoryTabProps {
   triggerHaptic: (type?: any) => void;
   favorites?: Track[];
   onToggleFavorite?: (track: Track) => void;
+  isLoggedIn?: boolean;
+  onOpenLogin?: () => void;
 }
 
 export const HistoryTab: React.FC<HistoryTabProps> = ({
@@ -40,10 +42,49 @@ export const HistoryTab: React.FC<HistoryTabProps> = ({
   triggerHaptic,
   favorites = [],
   onToggleFavorite,
+  isLoggedIn = true,
+  onOpenLogin,
 }) => {
   const [sendingId, setSendingId] = useState<string | number | null>(null);
   const [justSentId, setJustSentId] = useState<string | number | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  if (!isLoggedIn) {
+    return (
+      <div className="flex flex-col gap-4 pb-24 animate-fade-in">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-bold text-zinc-100 flex items-center gap-1.5">
+              <History className="w-5 h-5 text-sky-400" />
+              История скачиваний
+            </h2>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              Ваша история отправленных в Telegram треков
+            </p>
+          </div>
+        </div>
+
+        <div className="text-center py-16 px-6 rounded-3xl bg-white/[0.05] backdrop-blur-2xl border border-white/15 flex flex-col items-center shadow-2xl">
+          <div className="w-16 h-16 rounded-3xl bg-sky-500/15 border border-sky-500/25 flex items-center justify-center text-sky-400 mb-4 shadow-lg shadow-sky-500/10">
+            <History className="w-8 h-8" />
+          </div>
+          <h3 className="text-lg md:text-xl font-extrabold text-white">
+            Войдите через Telegram
+          </h3>
+          <p className="text-xs md:text-sm text-zinc-300 max-w-sm mt-2 mb-6 leading-relaxed">
+            История сохраняет все треки, которые вы отправляете в Telegram чат, чтобы их можно было легко найти и послушать снова.
+          </p>
+          <button
+            onClick={onOpenLogin}
+            className="px-6 py-3 rounded-full bg-[#24A1DE] hover:bg-[#1F93CC] text-white font-bold text-xs md:text-sm transition-all shadow-lg shadow-sky-500/25 active:scale-95 flex items-center gap-2 cursor-pointer"
+          >
+            <Send className="w-4 h-4 fill-white text-white -rotate-12" />
+            <span>Войти через Telegram</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const getTrackCover = (track: Track): string => {
     if (track.thumbnail) return track.thumbnail;

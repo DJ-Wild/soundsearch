@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { Play, Pause, Heart, Send, ExternalLink, Check, Loader2, Music } from 'lucide-react';
-import { Track } from '../types/music';
+import React, { useState, useEffect } from 'react';
+import { Play, Pause, Heart, Send, ExternalLink, Check, Loader2, Music, Activity } from 'lucide-react';
+import { Track, SourceQuality } from '../types/music';
 import { formatDuration, getPlatformMeta, sanitizeTrackMetadata } from '../utils/musicLogic';
 
 interface TrackCardProps {
@@ -22,9 +22,33 @@ export const TrackCard: React.FC<TrackCardProps> = ({
 }) => {
   const [isSending, setIsSending] = useState(false);
   const [justSent, setJustSent] = useState(false);
+  const [quality, setQuality] = useState<SourceQuality | null>(track.quality || null);
 
   const meta = getPlatformMeta(track.platform);
   const clean = sanitizeTrackMetadata(track.title, track.artist);
+
+  // Фоновая загрузка оригинального качества и кодека источника
+  useEffect(() => {
+    if (quality || !track.url) return;
+    let alive = true;
+    const fetchQuality = async () => {
+      try {
+        const res = await fetch(
+          `/api/audio-quality?platform=${encodeURIComponent(track.platform)}&url=${encodeURIComponent(track.url)}`
+        );
+        if (res.ok) {
+          const data = (await res.json()) as SourceQuality;
+          if (alive && data.status === 'ok') {
+            setQuality(data);
+          }
+        }
+      } catch {}
+    };
+    fetchQuality();
+    return () => {
+      alive = false;
+    };
+  }, [track.url, track.platform, quality]);
 
   const handleSend = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -62,14 +86,11 @@ export const TrackCard: React.FC<TrackCardProps> = ({
               loading="lazy"
             />
           ) : (
-            <div
-              className={`w-full h-full bg-gradient-to-tr ${meta.gradient} flex items-center justify-center`}
-            >
+            <div className={`w-full h-full bg-gradient-to-tr ${meta.gradient} flex items-center justify-center`}>
               <Music className="w-6 h-6 md:w-8 md:h-8 text-white/90" />
             </div>
           )}
 
-          {/* Inline play/pause overlay with liquid glass styling */}
           <button
             onClick={() => onPlayToggle(track)}
             className={`absolute inset-0 flex items-center justify-center transition-all ${
@@ -91,14 +112,25 @@ export const TrackCard: React.FC<TrackCardProps> = ({
           </button>
         </div>
 
-        {/* Track Title, Artist, and Duration */}
+        {/* Track Title, Artist, and Duration + Quality Badge */}
         <div className="flex-1 min-w-0 pr-1">
-          <div className="flex items-center gap-1.5 mb-1">
+          <div className="flex items-center gap-1.5 mb-1 flex-wrap">
             <span
               className={`text-[9.5px] md:text-[10.5px] font-bold uppercase px-2 py-0.5 rounded-full border shadow-xs ${meta.bg}`}
             >
               {meta.name}
             </span>
+
+            {quality && quality.status === 'ok' && quality.codec && (
+              <span
+                className="text-[9.5px] font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 flex items-center gap-1 shadow-xs"
+                title="Оригинальное качество источника"
+              >
+                <Activity className="w-2.5 h-2.5" />
+                {quality.codec} {quality.bitrateKbps ? `${quality.bitrateKbps}k` : ''}
+              </span>
+            )}
+
             {track.duration ? (
               <span className="text-[11px] md:text-xs text-zinc-300 font-mono">
                 {formatDuration(track.duration)}
@@ -113,10 +145,7 @@ export const TrackCard: React.FC<TrackCardProps> = ({
             {track.title}
           </h3>
 
-          <p
-            className="text-xs md:text-sm text-zinc-300 truncate mt-0.5"
-            title={track.artist}
-          >
+          <p className="text-xs md:text-sm text-zinc-300 truncate mt-0.5" title={track.artist}>
             {track.artist}
           </p>
         </div>

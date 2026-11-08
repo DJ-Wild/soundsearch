@@ -32,7 +32,8 @@ test('parseSearchQuery parses "title - artist" and plain queries', () => {
 });
 
 test('formatDuration formats seconds to mm:ss', () => {
-  assert.equal(formatDuration(0), '0:30');
+  assert.equal(formatDuration(0), '0:00');
+  assert.equal(formatDuration(30), '0:30');
   assert.equal(formatDuration(65), '1:05');
   assert.equal(formatDuration(180), '3:00');
   assert.equal(formatDuration(359), '5:59');

@@ -6,6 +6,7 @@ export interface TelegramWebApp {
   expand: () => void;
   close: () => void;
   initData: string;
+  platform?: string;
   initDataUnsafe?: {
     user?: {
       id: number;
@@ -56,7 +57,7 @@ declare global {
 
 export function useTelegram() {
   const [tg, setTg] = useState<TelegramWebApp | null>(null);
-  const [user, setUser] = useState<TelegramUserInfo>({ id: 0, first_name: 'Пользователь' });
+  const [user, setUser] = useState<TelegramUserInfo>({ id: 0, first_name: '' });
   const [isInsideTelegram, setIsInsideTelegram] = useState(false);
   const [colorScheme, setColorScheme] = useState<'light' | 'dark'>('dark');
 
@@ -71,8 +72,13 @@ export function useTelegram() {
         console.warn('Telegram WebApp init warning:', e);
       }
 
-      // initDataUnsafe is untrusted. Only server-verified initData establishes identity.
-      setIsInsideTelegram(Boolean(webApp.initData));
+      // Автоматическое определение среды Telegram WebApp
+      const inside = Boolean(
+        webApp.initData ||
+        webApp.initDataUnsafe?.user ||
+        (webApp.platform && webApp.platform !== 'unknown')
+      );
+      setIsInsideTelegram(inside);
 
       if (webApp.colorScheme) {
         setColorScheme(webApp.colorScheme);

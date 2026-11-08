@@ -1,5 +1,13 @@
 export type Platform = 'youtube' | 'soundcloud' | 'yandex' | 'spotify' | 'apple';
 
+export interface SourceQuality {
+  status: 'ok' | 'unknown';
+  codec?: string;
+  bitrateKbps?: number;
+  approximate?: boolean;
+  reason?: string;
+}
+
 export interface Track {
   id?: string | number;
   title: string;
@@ -11,6 +19,7 @@ export interface Track {
   preview_url?: string;
   downloaded_at?: string;
   is_favorite?: boolean;
+  quality?: SourceQuality;
 }
 
 export interface FavoriteItem {

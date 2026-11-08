@@ -6,10 +6,10 @@ import type { Request, Response } from 'express';
 import { Platform, Track, SendTrackResponse } from '../types/music';
 import { parseSearchQuery, detectPlatformFromUrl } from '../utils/musicLogic';
 import { db_add_history } from './db';
+import { searchYandexMusic } from './yandexMusic';
 
 const execFileAsync = promisify(execFile);
 
-// Cached SoundCloud client_id
 let cachedSCClientId: string = 'OGA0P5R5U4CpyooNe9OUcnjIMxao2hB2';
 let lastSCClientIdFetch = 0;
 
@@ -27,9 +27,7 @@ export async function getSoundCloudClientId(): Promise<string> {
       },
     }).then((r) => r.text());
 
-    const scriptUrls = [
-      ...html.matchAll(/<script[^>]+src=\"(https:\/\/[^\"]+\.js)\"/g),
-    ].map((m) => m[1]);
+    const scriptUrls = [...html.matchAll(/<script[^>]+src=\"(https:\/\/[^\"]+\.js)\"/g)].map((m) => m[1]);
 
     for (const url of scriptUrls.slice(-6)) {
       try {
@@ -50,7 +48,7 @@ export async function getSoundCloudClientId(): Promise<string> {
 }
 
 /**
- * Searches tracks across platforms (YouTube, SoundCloud, Yandex Music)
+ * Поиск треков: YouTube, SoundCloud, Яндекс Музыка (настоящий поиск!)
  */
 export async function searchTracks(query: string, platform: Platform): Promise<Track[]> {
   const { cleanQuery, title: parsedTitle, artist: parsedArtist } = parseSearchQuery(query);
@@ -68,11 +66,13 @@ export async function searchTracks(query: string, platform: Platform): Promise<T
     }
 
     if (platform === 'yandex') {
-      const yandexResults = await searchMusicCatalog(cleanQuery, 'yandex');
-      if (yandexResults.length > 0) return yandexResults;
+      const yandexRealResults = await searchYandexMusic(cleanQuery);
+      if (yandexRealResults.length > 0) return yandexRealResults;
+
+      const fallbackCatalog = await searchMusicCatalog(cleanQuery, 'yandex');
+      if (fallbackCatalog.length > 0) return fallbackCatalog;
     }
 
-    // Fallback catalog
     const metaResults = await searchMusicCatalog(cleanQuery, platform);
     if (metaResults.length > 0) return metaResults;
   } catch (err) {
@@ -82,9 +82,6 @@ export async function searchTracks(query: string, platform: Platform): Promise<T
   return generateCuratedResults(cleanQuery, platform, parsedTitle, parsedArtist);
 }
 
-/**
- * Search YouTube web for videos
- */
 async function searchYouTubeWeb(query: string): Promise<Track[]> {
   try {
     const encoded = encodeURIComponent(query);
@@ -104,8 +101,8 @@ async function searchYouTubeWeb(query: string): Promise<Track[]> {
     if (dataMatch && dataMatch[1]) {
       const data = JSON.parse(dataMatch[1]);
       const contents =
-        data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
-          ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+        data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]
+          ?.itemSectionRenderer?.contents || [];
 
       const tracks: Track[] = [];
 
@@ -115,15 +112,12 @@ async function searchYouTubeWeb(query: string): Promise<Track[]> {
 
         const title = video.title?.runs?.[0]?.text || 'YouTube Track';
         const artist =
-          video.ownerText?.runs?.[0]?.text ||
-          video.longBylineText?.runs?.[0]?.text ||
-          'YouTube';
+          video.ownerText?.runs?.[0]?.text || video.longBylineText?.runs?.[0]?.text || 'YouTube';
         const videoId = video.videoId;
         const thumbnail =
           video.thumbnail?.thumbnails?.[video.thumbnail.thumbnails.length - 1]?.url ||
           `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
-        // Parse duration
         const lengthText = video.lengthText?.simpleText;
         let duration = 180;
         if (lengthText) {
@@ -149,9 +143,7 @@ async function searchYouTubeWeb(query: string): Promise<Track[]> {
         if (tracks.length >= 25) break;
       }
 
-      if (tracks.length > 0) {
-        return tracks;
-      }
+      if (tracks.length > 0) return tracks;
     }
   } catch (e) {
     console.warn('YouTube direct parse failed, falling back to catalog:', e);
@@ -159,9 +151,6 @@ async function searchYouTubeWeb(query: string): Promise<Track[]> {
   return [];
 }
 
-/**
- * Real SoundCloud tracks search with progressive full length streaming
- */
 async function searchSoundCloudWeb(query: string): Promise<Track[]> {
   try {
     const clientId = await getSoundCloudClientId();
@@ -179,7 +168,6 @@ async function searchSoundCloudWeb(query: string): Promise<Track[]> {
     const data = (await res.json()) as any;
     if (!data.collection || !Array.isArray(data.collection)) return [];
 
-    // Filter out DRM tracks so search results are fully streamable
     const unencryptedTracks = data.collection.filter((item: any) => !isTrackDrmProtected(item));
     const finalCollection = unencryptedTracks.length > 0 ? unencryptedTracks : data.collection;
 
@@ -188,9 +176,7 @@ async function searchSoundCloudWeb(query: string): Promise<Track[]> {
       const artwork = item.artwork_url
         ? item.artwork_url.replace('-large', '-t500x500')
         : item.user?.avatar_url || '';
-      const permalink =
-        item.permalink_url ||
-        `https://soundcloud.com/search?q=${encodeURIComponent(item.title)}`;
+      const permalink = item.permalink_url || `https://soundcloud.com/search?q=${encodeURIComponent(item.title)}`;
 
       return {
         id: String(item.id),
@@ -200,11 +186,9 @@ async function searchSoundCloudWeb(query: string): Promise<Track[]> {
         platform: 'soundcloud' as Platform,
         duration: durationSec,
         thumbnail: artwork,
-        preview_url: `/api/stream-audio?url=${encodeURIComponent(
-          permalink
-        )}&title=${encodeURIComponent(item.title)}&artist=${encodeURIComponent(
-          item.user?.username || ''
-        )}&duration=${durationSec}`,
+        preview_url: `/api/stream-audio?url=${encodeURIComponent(permalink)}&title=${encodeURIComponent(
+          item.title
+        )}&artist=${encodeURIComponent(item.user?.username || '')}&duration=${durationSec}`,
       };
     });
   } catch (e) {
@@ -213,9 +197,6 @@ async function searchSoundCloudWeb(query: string): Promise<Track[]> {
   }
 }
 
-/**
- * Universal catalog search (Deezer & iTunes) with platform branding
- */
 async function searchMusicCatalog(query: string, platform: Platform): Promise<Track[]> {
   const [deezerTracks, itunesTracks] = await Promise.all([
     searchDeezer(query, platform).catch(() => []),
@@ -223,14 +204,10 @@ async function searchMusicCatalog(query: string, platform: Platform): Promise<Tr
   ]);
 
   const map = new Map<string, Track>();
-
   for (const t of [...deezerTracks, ...itunesTracks]) {
     const key = `${t.title.toLowerCase()}-${t.artist.toLowerCase()}`;
-    if (!map.has(key)) {
-      map.set(key, t);
-    }
+    if (!map.has(key)) map.set(key, t);
   }
-
   return Array.from(map.values());
 }
 
@@ -238,7 +215,6 @@ async function searchDeezer(query: string, platform: Platform): Promise<Track[]>
   const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=25`;
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) return [];
-
   const json = (await res.json()) as any;
   if (!json.data || !Array.isArray(json.data)) return [];
 
@@ -267,22 +243,17 @@ async function searchDeezer(query: string, platform: Platform): Promise<Track[]>
       platform,
       duration: durationSec,
       thumbnail: item.album?.cover_medium || item.album?.cover || item.artist?.picture_medium,
-      preview_url: `/api/stream-audio?url=${encodeURIComponent(
-        trackUrl
-      )}&title=${encodeURIComponent(item.title)}&artist=${encodeURIComponent(
-        item.artist?.name || ''
-      )}&duration=${durationSec}`,
+      preview_url: `/api/stream-audio?url=${encodeURIComponent(trackUrl)}&title=${encodeURIComponent(
+        item.title
+      )}&artist=${encodeURIComponent(item.artist?.name || '')}&duration=${durationSec}`,
     };
   });
 }
 
 async function searchITunes(query: string, platform: Platform): Promise<Track[]> {
-  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(
-    query
-  )}&entity=song&limit=25`;
+  const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=25`;
   const res = await fetch(url);
   if (!res.ok) return [];
-
   const json = (await res.json()) as any;
   if (!json.results || !Array.isArray(json.results)) return [];
 
@@ -311,11 +282,9 @@ async function searchITunes(query: string, platform: Platform): Promise<Track[]>
       platform,
       duration: durationSec,
       thumbnail: item.artworkUrl100?.replace('100x100bb', '600x600bb'),
-      preview_url: `/api/stream-audio?url=${encodeURIComponent(
-        trackUrl
-      )}&title=${encodeURIComponent(item.trackName)}&artist=${encodeURIComponent(
-        item.artistName || ''
-      )}&duration=${durationSec}`,
+      preview_url: `/api/stream-audio?url=${encodeURIComponent(trackUrl)}&title=${encodeURIComponent(
+        item.trackName
+      )}&artist=${encodeURIComponent(item.artistName || '')}&duration=${durationSec}`,
     };
   });
 }
@@ -329,11 +298,7 @@ function generateCuratedResults(
   const baseTitle = parsedTitle || query;
   const baseArtist =
     parsedArtist ||
-    (platform === 'yandex'
-      ? 'Яндекс Музыка'
-      : platform === 'soundcloud'
-      ? 'SoundCloud'
-      : 'YouTube Artist');
+    (platform === 'yandex' ? 'Яндекс Музыка' : platform === 'soundcloud' ? 'SoundCloud' : 'YouTube Artist');
 
   return [
     {
@@ -351,26 +316,17 @@ function generateCuratedResults(
       duration: 215,
       thumbnail:
         'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500&auto=format&fit=crop&q=80',
-      preview_url: `/api/stream-audio?title=${encodeURIComponent(
-        baseTitle
-      )}&artist=${encodeURIComponent(baseArtist)}`,
+      preview_url: `/api/stream-audio?title=${encodeURIComponent(baseTitle)}&artist=${encodeURIComponent(baseArtist)}`,
     },
   ];
 }
 
-/**
- * Resolves metadata and audio from a direct URL
- */
-export async function resolveTrackByUrl(
-  url: string,
-  specifiedPlatform?: Platform
-): Promise<Track> {
+export async function resolveTrackByUrl(url: string, specifiedPlatform?: Platform): Promise<Track> {
   const cleanUrl = (url || '').trim();
   const detected = detectPlatformFromUrl(cleanUrl);
   const platform = detected || specifiedPlatform || 'youtube';
 
   try {
-    // 1. YouTube links (youtube.com, youtu.be, music.youtube.com)
     if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) {
       const videoIdMatch = cleanUrl.match(/(?:v=|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})/);
       const videoId = videoIdMatch ? videoIdMatch[1] : '';
@@ -394,9 +350,9 @@ export async function resolveTrackByUrl(
             platform: 'youtube',
             duration,
             thumbnail,
-            preview_url: `/api/stream-audio?url=${encodeURIComponent(
-              cleanUrl
-            )}&title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}&duration=${duration}`,
+            preview_url: `/api/stream-audio?url=${encodeURIComponent(cleanUrl)}&title=${encodeURIComponent(
+              title
+            )}&artist=${encodeURIComponent(artist)}&duration=${duration}`,
           };
         } catch (e) {
           console.warn('OEmbed fetch error:', e);
@@ -404,13 +360,11 @@ export async function resolveTrackByUrl(
       }
     }
 
-    // 2. Extract keywords from URL path and search parameters for catalog resolution
     let keywords = '';
     try {
       const urlObj = new URL(cleanUrl);
       const queryParams = urlObj.searchParams;
-      const searchParam =
-        queryParams.get('text') || queryParams.get('q') || queryParams.get('query') || '';
+      const searchParam = queryParams.get('text') || queryParams.get('q') || queryParams.get('query') || '';
 
       if (searchParam) {
         keywords = decodeURIComponent(searchParam).trim();
@@ -420,7 +374,9 @@ export async function resolveTrackByUrl(
           .filter(
             (p) =>
               !/^\d+$/.test(p) &&
-              !['album', 'track', 'artist', 'music', 'us', 'ru', 'sets', 'discover', 'song', 'search', 'results'].includes(p.toLowerCase())
+              !['album', 'track', 'artist', 'music', 'us', 'ru', 'sets', 'discover', 'song', 'search', 'results'].includes(
+                p.toLowerCase()
+              )
           )
           .map((p) => decodeURIComponent(p).replace(/[-_]/g, ' '));
         keywords = filteredParts.join(' ').trim();
@@ -435,126 +391,18 @@ export async function resolveTrackByUrl(
           ...best,
           url: cleanUrl,
           platform,
-          preview_url: `/api/stream-audio?url=${encodeURIComponent(
-            cleanUrl
-          )}&title=${encodeURIComponent(best.title)}&artist=${encodeURIComponent(best.artist)}&duration=${best.duration}`,
+          preview_url: `/api/stream-audio?url=${encodeURIComponent(cleanUrl)}&title=${encodeURIComponent(
+            best.title
+          )}&artist=${encodeURIComponent(best.artist)}&duration=${best.duration}`,
         };
       }
     }
 
-    // 3. HTML Meta scraping for Yandex Music, Spotify, Apple Music, and web links
-    try {
-      const isYandexLink = cleanUrl.includes('music.yandex') || cleanUrl.includes('yandex.ru');
-      let targetScrapeUrl = cleanUrl;
-
-      // For Yandex Music, canonicalize track URLs: album/123/track/456 -> track/456
-      // which guarantees Twitterbot OpenGraph tag responses from Yandex servers
-      if (isYandexLink) {
-        const trackIdMatch = cleanUrl.match(/(?:track\/|track\?id=)(\d+)/i);
-        const albumIdMatch = cleanUrl.match(/(?:album\/|album\?id=)(\d+)/i);
-        if (trackIdMatch) {
-          targetScrapeUrl = `https://music.yandex.ru/track/${trackIdMatch[1]}`;
-        } else if (albumIdMatch) {
-          targetScrapeUrl = `https://music.yandex.ru/album/${albumIdMatch[1]}`;
-        }
-      }
-
-      const fetchUA = isYandexLink
-        ? 'Twitterbot/1.0'
-        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-      const metaRes = await fetch(targetScrapeUrl, {
-        headers: { 'User-Agent': fetchUA },
-      });
-
-      if (metaRes.ok) {
-        const html = await metaRes.text();
-        const ogTitleMatch =
-          html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ||
-          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
-        const ogDescMatch =
-          html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
-          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i);
-        const ogImageMatch =
-          html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ||
-          html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
-        const titleTagMatch = html.match(/<title>([^<]+)<\/title>/i);
-
-        let rawTitle = ogTitleMatch?.[1] || '';
-        const rawDesc = ogDescMatch?.[1] || '';
-        let coverArt = ogImageMatch?.[1] || '';
-
-        // If title not found in meta, inspect title tag
-        if (!rawTitle && titleTagMatch?.[1]) {
-          const t = titleTagMatch[1];
-          if (!t.includes('собираем музыку') && !t.includes('404')) {
-            rawTitle = t.replace(/на Яндекс Музыке|слушать онлайн.*$/gi, '').trim();
-          }
-        }
-
-        // Ensure high-resolution cover artwork from Yandex avatars
-        if (coverArt && coverArt.includes('avatars.yandex.net')) {
-          coverArt = coverArt.replace(/\/m\d+x\d+/, '/m1000x1000');
-          if (!coverArt.includes('/m1000x1000') && coverArt.includes('.a.')) {
-            coverArt = `${coverArt.replace(/\/[^/]+$/, '')}/m1000x1000`;
-          }
-        }
-
-        if (rawTitle && !rawTitle.toLowerCase().includes('404') && !rawTitle.includes('собираем музыку')) {
-          const cleanTrackTitle = rawTitle
-            .replace(/on Apple Music|на Яндекс Музыке|в Spotify|на SoundCloud/gi, '')
-            .replace(/[-|—–]/g, ' ')
-            .trim();
-
-          let extractedArtist = 'Яндекс Музыка';
-          if (rawDesc && rawDesc.includes('•')) {
-            extractedArtist = rawDesc.split('•')[0].trim();
-          } else if (rawDesc && !rawDesc.toLowerCase().includes('персональные')) {
-            extractedArtist = rawDesc.replace(/[-|—–]/g, ' ').trim();
-          }
-
-          const catalogQuery = `${extractedArtist} ${cleanTrackTitle}`.trim();
-          const catalog = await searchMusicCatalog(catalogQuery || cleanTrackTitle, platform);
-          const best = catalog[0];
-
-          const finalTitle = cleanTrackTitle || best?.title || 'Трек по ссылке';
-          const finalArtist =
-            extractedArtist !== 'Яндекс Музыка'
-              ? extractedArtist
-              : best?.artist || 'Яндекс Музыка';
-          const finalDuration = best?.duration || 180;
-          const finalThumbnail = coverArt || best?.thumbnail || '';
-
-          return {
-            id: best?.id || `yandex-${Date.now()}`,
-            title: finalTitle,
-            artist: finalArtist,
-            url: cleanUrl,
-            platform,
-            duration: finalDuration,
-            thumbnail: finalThumbnail,
-            preview_url: `/api/stream-audio?url=${encodeURIComponent(
-              cleanUrl
-            )}&title=${encodeURIComponent(finalTitle)}&artist=${encodeURIComponent(
-              finalArtist
-            )}&duration=${finalDuration}`,
-          };
-        }
-      }
-    } catch (e) {
-      console.warn('Meta fetch error for URL:', e);
-    }
-
-    // 4. Fallback for pure numerical IDs or unparseable URLs
     const fallbackTitle =
       platform === 'yandex'
         ? 'Яндекс Музыка'
         : platform === 'soundcloud'
         ? 'SoundCloud Track'
-        : platform === 'spotify'
-        ? 'Spotify Track'
-        : platform === 'apple'
-        ? 'Apple Music'
         : 'Трек по ссылке';
 
     return {
@@ -565,9 +413,9 @@ export async function resolveTrackByUrl(
       duration: 180,
       thumbnail:
         'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=500&auto=format&fit=crop&q=80',
-      preview_url: `/api/stream-audio?url=${encodeURIComponent(
-        cleanUrl
-      )}&title=${encodeURIComponent(fallbackTitle)}&duration=180`,
+      preview_url: `/api/stream-audio?url=${encodeURIComponent(cleanUrl)}&title=${encodeURIComponent(
+        fallbackTitle
+      )}&duration=180`,
     };
   } catch (err) {
     return {
@@ -578,40 +426,40 @@ export async function resolveTrackByUrl(
       duration: 180,
       thumbnail:
         'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=500&auto=format&fit=crop&q=80',
-      preview_url: `/api/stream-audio?url=${encodeURIComponent(
-        cleanUrl
-      )}&title=Трек%20по%20ссылке&duration=180`,
+      preview_url: `/api/stream-audio?url=${encodeURIComponent(cleanUrl)}&title=Трек%20по%20ссылке&duration=180`,
     };
   }
 }
 
-/**
- * Detects whether a SoundCloud track is DRM-encrypted (SoundCloud Go+ / encrypted HLS)
- */
 export function isTrackDrmProtected(item: any): boolean {
-  if (!item) return false;
+  if (!item) return true;
   if (item.access === 'blocked' || item.snippeted) return true;
+  if (item.policy === 'SNIP') return true;
+  if (typeof item.duration === 'number' && item.duration <= 45000) return true;
   const transcodings = item.media?.transcodings;
-  if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
-    return false;
-  }
+  if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) return true;
   const hasUnencrypted = transcodings.some(
     (t: any) =>
-      t.format?.protocol === 'hls' ||
       t.format?.protocol === 'progressive' ||
-      (t.format?.protocol && !t.format.protocol.includes('encrypted'))
+      (t.format?.protocol === 'hls' && !t.format?.mime_type?.includes('encrypted'))
   );
   return !hasUnencrypted;
 }
 
-/**
- * Cleans video clip titles for music matching (removes clips, video tags, etc.)
- */
 function cleanQueryForAudio(title: string, artist?: string): string {
   let clean = title || '';
-  clean = clean.replace(/\((премьера клипа|клип|official video|official audio|video|remastered|lyric video|music video|audio|official|prod\.[^)]*)[^)]*\)/gi, '');
-  clean = clean.replace(/\[(премьера клипа|клип|official video|official audio|video|remastered|lyric video|music video|audio|official|prod\.[^\]]*)[^\]]*\]/gi, '');
-  clean = clean.replace(/(\bofficial video\b|\bofficial music video\b|\bклип\b|\bпремьера клипа\b|\bvisualizer\b)/gi, '');
+  clean = clean.replace(
+    /\((премьера клипа|клип|official video|official audio|video|remastered|lyric video|music video|audio|official|prod\.[^)]*)[^)]*\)/gi,
+    ''
+  );
+  clean = clean.replace(
+    /\[(премьера клипа|клип|official video|official audio|video|remastered|lyric video|music video|audio|official|prod\.[^\]]*)[^\]]*\]/gi,
+    ''
+  );
+  clean = clean.replace(
+    /(\bofficial video\b|\bofficial music video\b|\bклип\b|\bпремьера клипа\b|\bvisualizer\b)/gi,
+    ''
+  );
   clean = clean.replace(/[|—–-]/g, ' ');
   if (artist && !clean.toLowerCase().includes(artist.toLowerCase())) {
     clean = `${clean} ${artist}`;
@@ -619,12 +467,8 @@ function cleanQueryForAudio(title: string, artist?: string): string {
   return clean.replace(/\s+/g, ' ').trim();
 }
 
-// Fast in-memory cache for resolved audio streams (avoids redundant 3-second yt-dlp calls)
 const streamUrlCache = new Map<string, { url: string; timestamp: number }>();
 
-/**
- * Detects whether a URL is a search page or non-playable collection link
- */
 function isSearchOrNonPlayableUrl(url: string): boolean {
   if (!url || typeof url !== 'string') return true;
   const lower = url.toLowerCase();
@@ -638,14 +482,7 @@ function isSearchOrNonPlayableUrl(url: string): boolean {
   );
 }
 
-/**
- * Resolves an unencrypted audio stream directly via SoundCloud API in ~150ms
- * Bypasses yt-dlp process overhead, DRM issues, and YouTube bot detection entirely
- */
-async function resolveDirectSoundCloudStream(
-  queryOrUrl: string,
-  isDirectUrl = false
-): Promise<string> {
+export async function resolveDirectSoundCloudStream(queryOrUrl: string, isDirectUrl = false): Promise<string> {
   try {
     const clientId = await getSoundCloudClientId();
     if (!clientId) return '';
@@ -655,12 +492,13 @@ async function resolveDirectSoundCloudStream(
     if (isDirectUrl && queryOrUrl.includes('soundcloud.com/') && !isSearchOrNonPlayableUrl(queryOrUrl)) {
       try {
         const res = await fetch(
-          `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(
-            queryOrUrl
-          )}&client_id=${clientId}`
+          `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(queryOrUrl)}&client_id=${clientId}`
         );
         if (res.ok) {
-          trackItem = await res.json();
+          const resolved = await res.json();
+          if (!isTrackDrmProtected(resolved)) {
+            trackItem = resolved;
+          }
         }
       } catch {}
     }
@@ -669,26 +507,22 @@ async function resolveDirectSoundCloudStream(
       const query = isDirectUrl ? cleanQueryForAudio(queryOrUrl) : queryOrUrl;
       if (!query) return '';
       const searchRes = await fetch(
-        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(
-          query
-        )}&client_id=${clientId}&limit=6`
+        `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=15`
       );
       if (searchRes.ok) {
         const data = (await searchRes.json()) as any;
         const nonDrm = (data.collection || []).filter((item: any) => !isTrackDrmProtected(item));
-        trackItem = nonDrm[0] || data.collection?.[0];
+        trackItem = nonDrm[0] || null;
       }
     }
 
     if (!trackItem) return '';
 
     const transcodings = trackItem.media?.transcodings || [];
-    // Prioritize progressive MP3 or unencrypted HLS
     const targetTranscoding =
       transcodings.find((t: any) => t.format?.protocol === 'progressive') ||
       transcodings.find(
-        (t: any) =>
-          t.format?.protocol === 'hls' && !t.format?.mime_type?.includes('encrypted')
+        (t: any) => t.format?.protocol === 'hls' && !t.format?.mime_type?.includes('encrypted')
       ) ||
       transcodings[0];
 
@@ -705,19 +539,14 @@ async function resolveDirectSoundCloudStream(
   return '';
 }
 
-/**
- * Resolves a high-quality direct MP3/AAC audio stream via Deezer & Apple Music APIs in ~50ms
- * 100% reliable across datacenters, zero bot-detection, zero rate limits
- */
 export async function resolveCatalogDirectStream(title?: string, artist?: string): Promise<string> {
   const query = `${title || ''} ${artist || ''}`.trim();
   if (!query) return '';
 
   try {
-    const dzRes = await fetch(
-      `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=5`,
-      { headers: { Accept: 'application/json' } }
-    );
+    const dzRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=5`, {
+      headers: { Accept: 'application/json' },
+    });
     if (dzRes.ok) {
       const dzData = (await dzRes.json()) as any;
       const track = dzData.data?.[0];
@@ -728,9 +557,7 @@ export async function resolveCatalogDirectStream(title?: string, artist?: string
   } catch {}
 
   try {
-    const itRes = await fetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=5`
-    );
+    const itRes = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=5`);
     if (itRes.ok) {
       const itData = (await itRes.json()) as any;
       const track = itData.results?.[0];
@@ -743,39 +570,13 @@ export async function resolveCatalogDirectStream(title?: string, artist?: string
   return '';
 }
 
-/**
- * Resolves an unencrypted, streamable audio URL automatically bypassing DRM tracks and search links
- */
-export async function resolveStreamUrl(
-  initialUrl: string,
-  title?: string,
-  artist?: string
-): Promise<string> {
+export async function resolveStreamUrl(initialUrl: string, title?: string, artist?: string): Promise<string> {
   const cacheKey = `${initialUrl || ''}|${title || ''}|${artist || ''}`;
   const cached = streamUrlCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < 30 * 60 * 1000) {
     return cached.url;
   }
 
-  // 1. If initialUrl is already a direct playable audio stream URL
-  if (initialUrl && initialUrl.startsWith('http') && (initialUrl.includes('.mp3') || initialUrl.includes('.m4a') || initialUrl.includes('dzcdn.net') || initialUrl.includes('apple.com'))) {
-    streamUrlCache.set(cacheKey, { url: initialUrl, timestamp: Date.now() });
-    return initialUrl;
-  }
-
-  const cleanSearchQuery = cleanQueryForAudio(title || '', artist || '');
-
-  // 2. High-speed, guaranteed direct MP3 stream from universal catalog (Deezer / Apple Music) in 50ms
-  const catalogStream =
-    (await resolveCatalogDirectStream(title, artist)) ||
-    (cleanSearchQuery ? await resolveCatalogDirectStream(cleanSearchQuery) : '');
-
-  if (catalogStream) {
-    streamUrlCache.set(cacheKey, { url: catalogStream, timestamp: Date.now() });
-    return catalogStream;
-  }
-
-  // 3. Direct high-speed SoundCloud API stream resolution
   if (initialUrl && initialUrl.includes('soundcloud.com/') && !isSearchOrNonPlayableUrl(initialUrl)) {
     const directStream = await resolveDirectSoundCloudStream(initialUrl, true);
     if (directStream) {
@@ -783,6 +584,8 @@ export async function resolveStreamUrl(
       return directStream;
     }
   }
+
+  const cleanSearchQuery = cleanQueryForAudio(title || '', artist || '');
 
   if (cleanSearchQuery) {
     const directStream = await resolveDirectSoundCloudStream(cleanSearchQuery, false);
@@ -792,11 +595,10 @@ export async function resolveStreamUrl(
     }
   }
 
-  // 4. Simplified title search
   if (title) {
     const simple = title.replace(/[|—–-]/g, ' ').replace(/\s+/g, ' ').trim();
     if (simple && simple !== cleanSearchQuery) {
-      const directStream = (await resolveCatalogDirectStream(simple)) || (await resolveDirectSoundCloudStream(simple, false));
+      const directStream = await resolveDirectSoundCloudStream(simple, false);
       if (directStream) {
         streamUrlCache.set(cacheKey, { url: directStream, timestamp: Date.now() });
         return directStream;
@@ -804,14 +606,25 @@ export async function resolveStreamUrl(
     }
   }
 
-  // 5. Fallback: yt-dlp for direct playable media links (ignoring search pages and datacenter-blocked YouTube)
+  if (
+    initialUrl &&
+    initialUrl.startsWith('http') &&
+    (initialUrl.includes('.mp3') || initialUrl.includes('.m4a')) &&
+    !initialUrl.includes('preview') &&
+    !initialUrl.includes('dzcdn.net') &&
+    !initialUrl.includes('apple.com') &&
+    !initialUrl.includes('mzstatic.com')
+  ) {
+    streamUrlCache.set(cacheKey, { url: initialUrl, timestamp: Date.now() });
+    return initialUrl;
+  }
+
   const ytdlPath = path.resolve(process.cwd(), 'bin/yt-dlp');
   try {
     fs.chmodSync(ytdlPath, 0o755);
   } catch {}
 
   const urlCandidates: string[] = [];
-
   if (initialUrl && !isSearchOrNonPlayableUrl(initialUrl)) {
     const isYouTube = initialUrl.includes('youtube.com') || initialUrl.includes('youtu.be');
     if (!isYouTube) {
@@ -832,19 +645,21 @@ export async function resolveStreamUrl(
         streamUrlCache.set(candidate, { url: streamUrl, timestamp: Date.now() });
         return streamUrl;
       }
-    } catch {
-      // Suppress noisy output for failed candidates
-    }
+    } catch {}
+  }
+
+  const catalogStream =
+    (await resolveCatalogDirectStream(title, artist)) ||
+    (cleanSearchQuery ? await resolveCatalogDirectStream(cleanSearchQuery) : '');
+
+  if (catalogStream) {
+    streamUrlCache.set(cacheKey, { url: catalogStream, timestamp: Date.now() });
+    return catalogStream;
   }
 
   return '';
 }
 
-/**
- * Direct full-length audio streaming pipeline
- * Direct MP3s redirect via 302 to CDN for instant hardware decoding and range scrubbing
- * HLS streams are piped and transcoded via FFmpeg
- */
 export async function streamAudioPipe(
   req: Request,
   res: Response,
@@ -852,7 +667,6 @@ export async function streamAudioPipe(
 ) {
   const targetUrl = options.url ? decodeURIComponent(options.url) : '';
   const streamUrl = await resolveStreamUrl(targetUrl, options.title, options.artist);
-  const targetDuration = options.duration && options.duration > 0 ? options.duration : 180;
   const startSeconds = Number(req.query.start) || 0;
 
   if (streamUrl && streamUrl.startsWith('http')) {
@@ -862,61 +676,35 @@ export async function streamAudioPipe(
       streamUrl.includes('apple.com') ||
       streamUrl.includes('mzstatic.com');
 
-    // Only redirect if it's already a full-length CDN stream and startSeconds is 0
     if (!isPreviewClip && startSeconds === 0 && (streamUrl.includes('.mp3') || streamUrl.includes('.m4a') || !streamUrl.includes('.m3u8'))) {
       res.redirect(302, streamUrl);
       return;
     }
 
-    // Pipe via FFmpeg for full-length playback
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Accept-Ranges', 'none');
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    const ffmpegArgs = [
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-    ];
-
-    if (isPreviewClip) {
-      // Loop the preview clip so the stream plays the FULL track duration without stopping at 30 seconds
-      ffmpegArgs.push('-stream_loop', '-1');
-    }
-
-    if (startSeconds > 0) {
-      ffmpegArgs.push('-ss', String(startSeconds));
-    }
-
-    ffmpegArgs.push('-i', streamUrl);
-
-    const remaining = Math.max(1, targetDuration - startSeconds);
-    ffmpegArgs.push(
-      '-t', String(remaining),
-      '-vn',
-      '-acodec', 'libmp3lame',
-      '-ab', '128k',
-      '-f', 'mp3',
-      'pipe:1'
-    );
+    const ffmpegArgs = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+    if (startSeconds > 0) ffmpegArgs.push('-ss', String(startSeconds));
+    ffmpegArgs.push('-i', streamUrl, '-vn', '-acodec', 'libmp3lame', '-ab', '128k', '-f', 'mp3', 'pipe:1');
 
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
     ffmpeg.stdout.pipe(res);
-    ffmpeg.stderr.on('data', () => {}); // silence verbose output
-
+    ffmpeg.stderr.on('data', () => {});
     ffmpeg.on('error', (err) => {
       console.warn('FFmpeg pipe error:', err.message);
       if (!res.headersSent) res.status(500).send('Stream error');
     });
 
     res.on('close', () => {
-      try { ffmpeg.kill('SIGKILL'); } catch {}
+      try {
+        ffmpeg.kill('SIGKILL');
+      } catch {}
     });
     return;
   }
 
-  // Final fallback: deliver backup audio file
   try {
     const backupUrl = 'https://cdn.freesound.org/previews/381/381382_634166-lq.mp3';
     res.redirect(302, backupUrl);
@@ -925,51 +713,24 @@ export async function streamAudioPipe(
   }
 }
 
-/**
- * Extracts MP3 Buffer directly using resolveStreamUrl & FFmpeg for direct Telegram file upload
- */
 async function getAudioMp3Buffer(track: Track): Promise<Buffer | null> {
   try {
     const streamUrl = await resolveStreamUrl(track.url, track.title, track.artist);
     if (!streamUrl || !streamUrl.startsWith('http')) return null;
 
-    const targetDuration = track.duration && track.duration > 0 ? track.duration : 180;
-    const isPreviewClip =
-      streamUrl.includes('preview') ||
-      streamUrl.includes('dzcdn.net') ||
-      streamUrl.includes('apple.com') ||
-      streamUrl.includes('mzstatic.com');
-
     return new Promise<Buffer | null>((resolve) => {
       let resolved = false;
-      const ffmpegArgs = [
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '3',
-        '-threads', '2',
-      ];
-
-      if (isPreviewClip) {
-        ffmpegArgs.push('-stream_loop', '-1');
-      }
-
-      ffmpegArgs.push(
-        '-i', streamUrl,
-        '-vn',
-        '-t', String(targetDuration),
-        '-acodec', 'libmp3lame',
-        '-ab', '128k',
-        '-f', 'mp3',
-        'pipe:1'
-      );
+      const ffmpegArgs = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '3', '-threads', '2'];
+      ffmpegArgs.push('-i', streamUrl, '-vn', '-acodec', 'libmp3lame', '-ab', '128k', '-f', 'mp3', 'pipe:1');
 
       const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
       const chunks: Buffer[] = [];
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          try { ffmpeg.kill('SIGKILL'); } catch {}
+          try {
+            ffmpeg.kill('SIGKILL');
+          } catch {}
           if (chunks.length > 0) resolve(Buffer.concat(chunks));
           else resolve(null);
         }
@@ -981,11 +742,7 @@ async function getAudioMp3Buffer(track: Track): Promise<Buffer | null> {
         if (!resolved) {
           resolved = true;
           clearTimeout(timer);
-          if (chunks.length > 0) {
-            resolve(Buffer.concat(chunks));
-          } else {
-            resolve(null);
-          }
+          resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
         }
       });
       ffmpeg.on('error', () => {
@@ -1002,13 +759,7 @@ async function getAudioMp3Buffer(track: Track): Promise<Buffer | null> {
   }
 }
 
-/**
- * Sends audio track directly to Telegram chat as an MP3 file using Telegram Bot API
- */
-export async function sendTrackToTelegram(
-  chatId: string | number,
-  track: Track
-): Promise<SendTrackResponse> {
+export async function sendTrackToTelegram(chatId: string | number, track: Track): Promise<SendTrackResponse> {
   const token = process.env.BOT_TOKEN;
   const numChatId = typeof chatId === 'string' ? parseInt(chatId, 10) || 0 : chatId;
 
@@ -1025,7 +776,7 @@ export async function sendTrackToTelegram(
   if (!token || token === 'MY_BOT_TOKEN') {
     return {
       success: true,
-      message: `Трек «${track.title}» готов! Бот токен в режиме симуляции. Добавьте BOT_TOKEN в .env для реальной отправки в Telegram чат.`,
+      message: `Трек «${track.title}» готов! Бот токен в режиме симуляции.`,
       sentToChat: chatId,
       track,
       audioUrl: track.preview_url,
@@ -1037,10 +788,7 @@ export async function sendTrackToTelegram(
     await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        action: 'upload_voice',
-      }),
+      body: JSON.stringify({ chat_id: chatId, action: 'upload_voice' }),
     }).catch(() => null);
 
     const caption = `🎵 *${escapeTgMarkdown(track.title)}*\n👤 *${escapeTgMarkdown(
@@ -1081,7 +829,7 @@ export async function sendTrackToTelegram(
       } else {
         return {
           success: false,
-          message: `Ошибка Telegram API: ${uploadData.description || 'Не удалось отправить MP3 файл'}`,
+          message: `Ошибка Telegram API: ${uploadData.description || 'Не удалось отправить файл'}`,
           error: uploadData.description,
           sentToChat: chatId,
           track,
@@ -1105,23 +853,6 @@ export async function sendTrackToTelegram(
       track,
     };
   }
-}
-
-async function fetchAudioBufferForTrack(streamPath: string): Promise<Buffer | null> {
-  try {
-    const port = process.env.PORT || 3000;
-    const url = streamPath.startsWith('http')
-      ? streamPath
-      : `http://127.0.0.1:${port}${streamPath}`;
-    const res = await fetch(url, { headers: { Accept: 'audio/mpeg' } });
-    if (res.ok) {
-      const arrayBuf = await res.arrayBuffer();
-      return Buffer.from(arrayBuf);
-    }
-  } catch (err) {
-    console.warn('Error fetching audio buffer for Telegram upload:', err);
-  }
-  return null;
 }
 
 function escapeTgMarkdown(text: string): string {

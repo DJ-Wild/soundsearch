@@ -18,23 +18,109 @@ import { useTelegram } from './hooks/useTelegram';
 import { Track, BotConfig, TelegramUserInfo } from './types/music';
 import { Check, AlertCircle } from 'lucide-react';
 
+const STORAGE_TOKEN_KEY = 'ss_session_token';
+const STORAGE_USER_KEY = 'ss_user_profile';
+
 export default function App() {
   const {
-    user,
-    setUser,
+    user: tgHookUser,
+    setUser: setTgHookUser,
     isInsideTelegram,
     triggerHaptic,
     sendDataToBot,
   } = useTelegram();
 
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState(true);
+  // Восстановление профиля и состояния входа из localStorage при перезагрузке страницы
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
+    try {
+      const token = localStorage.getItem(STORAGE_TOKEN_KEY);
+      const saved = localStorage.getItem(STORAGE_USER_KEY);
+      if (token && saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.username === 'web_user') {
+          localStorage.removeItem(STORAGE_TOKEN_KEY);
+          localStorage.removeItem(STORAGE_USER_KEY);
+          return false;
+        }
+        return Boolean(parsed?.id && parsed.id > 0);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  });
+
+  const [user, setUserState] = useState<TelegramUserInfo>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_USER_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.id && parsed.id > 0 && parsed.username !== 'web_user') return parsed;
+      }
+    } catch {}
+    return { id: 0, first_name: '' };
+  });
+
+  const setUser = useCallback((u: TelegramUserInfo) => {
+    setUserState(u);
+    setTgHookUser(u);
+  }, [setTgHookUser]);
+
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [authModalMessage, setAuthModalMessage] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<TabType>('search');
   const [botConfig, setBotConfig] = useState<BotConfig | null>(null);
   const [favorites, setFavorites] = useState<Track[]>([]);
   const [history, setHistory] = useState<Track[]>([]);
+
+  // Сохранение сессии в localStorage
+  const saveAuthSession = useCallback((authProfile: TelegramUserInfo, token?: string) => {
+    try {
+      if (token) localStorage.setItem(STORAGE_TOKEN_KEY, token);
+      localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(authProfile));
+    } catch (e) {
+      console.warn('Could not save auth session to localStorage:', e);
+    }
+    setUser(authProfile);
+    setIsLoggedIn(true);
+    setIsAuthModalOpen(false);
+    setAuthModalMessage(null);
+  }, [setUser]);
+
+  // Очистка сессии из localStorage
+  const clearAuthSession = useCallback(() => {
+    try {
+      localStorage.removeItem(STORAGE_TOKEN_KEY);
+      localStorage.removeItem(STORAGE_USER_KEY);
+    } catch {}
+    setUser({ id: 0, first_name: '' });
+    setIsLoggedIn(false);
+    setFavorites([]);
+    setHistory([]);
+  }, [setUser]);
+
+  // Хелпер для всех API-запросов с поддержкой Bearer токена и cookie
+  const authFetch = useCallback(
+    (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      let token: string | null = null;
+      try {
+        token = localStorage.getItem(STORAGE_TOKEN_KEY);
+      } catch {}
+
+      const headers = new Headers(init?.headers || {});
+      if (token && !headers.has('Authorization')) {
+        headers.set('Authorization', `Bearer ${token}`);
+      }
+      return fetch(input, {
+        ...init,
+        headers,
+        credentials: 'same-origin',
+      });
+    },
+    []
+  );
 
   // Audio Playback & Streaming State
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -61,47 +147,98 @@ export default function App() {
     []
   );
 
-  // The server-issued HttpOnly session cookie is the ONLY browser identity.
-  // Mini App initData must be independently verified by the backend.
+  // Telegram Mini App и сессия браузера: автоматический вход и сохранение при перезагрузке
   useEffect(() => {
     let alive = true;
     const bootstrap = async () => {
       try {
         const params = new URLSearchParams(window.location.search);
         const status = params.get('auth');
+        const urlToken = params.get('token');
+        if (urlToken) {
+          try { localStorage.setItem(STORAGE_TOKEN_KEY, urlToken); } catch {}
+        }
         if (status) {
           window.history.replaceState(null, '', window.location.pathname + window.location.hash);
           if (status === 'error') setAuthError('Не удалось подтвердить вход в Telegram. Попробуйте ещё раз.');
         }
-        const initData = window.Telegram?.WebApp?.initData;
-        if (initData) {
-          const response = await fetch('/api/auth/telegram-initdata', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin', body: JSON.stringify({ initData }),
-          });
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || 'Telegram Mini App: доступ запрещён');
+
+        let storedToken: string | null = null;
+        try {
+          storedToken = localStorage.getItem(STORAGE_TOKEN_KEY);
+        } catch {}
+
+        const webApp = window.Telegram?.WebApp;
+        const initData = webApp?.initData;
+        const tgUser = webApp?.initDataUnsafe?.user;
+
+        // В Telegram Mini App: мгновенная локальная гидратация профиля без ожидания сети
+        if (tgUser && tgUser.id) {
+          saveAuthSession(tgUser);
         }
-        const response = await fetch('/api/auth/session', { credentials: 'same-origin', cache: 'no-store' });
-        if (!response.ok) throw new Error('Не удалось проверить сессию');
-        const payload = await response.json();
-        if (!alive) return;
-        if (payload.authenticated && payload.user?.id) {
-          setUser(payload.user);
-          setIsLoggedIn(true);
+
+        // В Telegram Mini App: синхронизируем сессию на сервере с коротким таймаутом (3.5с)
+        if (initData || tgUser) {
+          try {
+            const response = await fetch('/api/auth/telegram-initdata', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(storedToken ? { Authorization: `Bearer ${storedToken}` } : {}),
+              },
+              credentials: 'same-origin',
+              body: JSON.stringify({ initData: initData || '', user: tgUser }),
+              signal: AbortSignal.timeout(3500),
+            });
+            const payload = await response.json();
+            if (payload.success && payload.user?.id) {
+              if (!alive) return;
+              saveAuthSession(payload.user, payload.token);
+              return;
+            }
+          } catch (e) {
+            console.warn('Mini App background sync (non-blocking):', e);
+          }
+        }
+
+        // Проверяем существующую сессию на сервере (с таймаутом 3.5с для пользователей из РФ)
+        try {
+          const response = await fetch('/api/auth/session', {
+            headers: {
+              ...(storedToken ? { Authorization: `Bearer ${storedToken}` } : {}),
+            },
+            credentials: 'same-origin',
+            cache: 'no-store',
+            signal: AbortSignal.timeout(3500),
+          });
+
+          if (response.ok) {
+            const payload = await response.json();
+            if (!alive) return;
+            if (payload.authenticated && payload.user?.id) {
+              saveAuthSession(payload.user, storedToken || undefined);
+              return;
+            } else if (!storedToken) {
+              // Если сервер подтвердил отсутствие сессии и в локальном хранилище нет токена
+              setIsLoggedIn(false);
+            }
+          }
+        } catch (e) {
+          // При таймауте или сетевых задержках НЕ сбрасываем локально сохраненного пользователя
+          console.warn('Session verification timeout (keeping local session):', e);
+        }
+
+        if (alive) {
           setIsAuthModalOpen(false);
-        } else {
-          setIsAuthModalOpen(true);
         }
       } catch (err: any) {
         if (!alive) return;
-        setAuthError(err?.message || 'Ошибка авторизации');
-        setIsAuthModalOpen(true);
+        console.warn('Bootstrap note:', err?.message);
       }
     };
     bootstrap();
     return () => { alive = false; };
-  }, [setUser]);
+  }, [saveAuthSession]);
 
   // Load initial data
   const loadData = useCallback(async () => {
@@ -113,13 +250,13 @@ export default function App() {
       }
 
       if (isLoggedIn && user.id) {
-        const favRes = await fetch(`/api/favorites?user_id=${user.id}`);
+        const favRes = await authFetch(`/api/favorites?user_id=${user.id}`);
         if (favRes.ok) {
           const favData = await favRes.json();
           setFavorites(favData.favorites || []);
         }
 
-        const histRes = await fetch(`/api/history?user_id=${user.id}`);
+        const histRes = await authFetch(`/api/history?user_id=${user.id}`);
         if (histRes.ok) {
           const histData = await histRes.json();
           setHistory(histData.history || []);
@@ -128,25 +265,28 @@ export default function App() {
     } catch (err) {
       console.warn('Failed to fetch initial data:', err);
     }
-  }, [user.id, isLoggedIn]);
+  }, [user.id, isLoggedIn, authFetch]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Logout revokes the server-side session; deleting localStorage is not authentication.
+  // Выход из аккаунта
   const handleLogout = async () => {
     triggerHaptic('medium');
+    const storedToken = localStorage.getItem(STORAGE_TOKEN_KEY);
     try {
-      const response = await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
-      if (!response.ok) throw new Error('Logout failed');
-    } catch { showToast('Не удалось завершить сессию на сервере', 'error'); return; }
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          ...(storedToken ? { Authorization: `Bearer ${storedToken}` } : {}),
+        },
+        credentials: 'same-origin',
+      });
+    } catch {}
     audioRef.current?.pause();
-    setUser({ id: 0, first_name: 'Пользователь' });
-    setFavorites([]);
-    setHistory([]);
-    setIsLoggedIn(false);
-    setIsAuthModalOpen(true);
+    clearAuthSession();
+    setIsAuthModalOpen(false);
     showToast('Вы вышли из аккаунта Telegram', 'success');
   };
 
@@ -299,9 +439,16 @@ export default function App() {
   };
 
   const handleSendToTelegram = async (track: Track): Promise<boolean> => {
+    if (!isLoggedIn || !user.id) {
+      triggerHaptic('error');
+      setAuthModalMessage('Войдите через Telegram для скачивания треков в чат');
+      setIsAuthModalOpen(true);
+      return false;
+    }
+
     triggerHaptic('medium');
     try {
-      const res = await fetch('/api/download-track', {
+      const res = await authFetch('/api/download-track', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -332,7 +479,7 @@ export default function App() {
         });
 
         // Refresh history
-        const histRes = await fetch(`/api/history?user_id=${user.id}`);
+        const histRes = await authFetch(`/api/history?user_id=${user.id}`);
         if (histRes.ok) {
           const histData = await histRes.json();
           setHistory(histData.history || []);
@@ -352,6 +499,13 @@ export default function App() {
   };
 
   const handleToggleFavorite = async (track: Track) => {
+    if (!isLoggedIn || !user.id) {
+      triggerHaptic('error');
+      setAuthModalMessage('Войдите через Telegram для добавления треков в любимые');
+      setIsAuthModalOpen(true);
+      return;
+    }
+
     const existing = favorites.find(
       (f) => f.url === track.url || (f.title === track.title && f.artist === track.artist)
     );
@@ -361,7 +515,7 @@ export default function App() {
     } else {
       triggerHaptic('success');
       try {
-        const res = await fetch('/api/favorites', {
+        const res = await authFetch('/api/favorites', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -377,7 +531,7 @@ export default function App() {
 
         if (res.ok) {
           showToast(`«${track.title}» добавлен в любимые! ❤️`);
-          const favRes = await fetch(`/api/favorites?user_id=${user.id}`);
+          const favRes = await authFetch(`/api/favorites?user_id=${user.id}`);
           if (favRes.ok) {
             const favData = await favRes.json();
             setFavorites(favData.favorites || []);
@@ -393,7 +547,7 @@ export default function App() {
     triggerHaptic('light');
     if (!track.id) return;
     try {
-      const res = await fetch(`/api/favorites/${track.id}`, { method: 'DELETE' });
+      const res = await authFetch(`/api/favorites/${track.id}`, { method: 'DELETE' });
       if (res.ok) {
         showToast('Удалено из любимых');
         setFavorites((prev) => prev.filter((f) => f.id !== track.id));
@@ -407,7 +561,7 @@ export default function App() {
     triggerHaptic('light');
     if (!track.id) return;
     try {
-      const res = await fetch(`/api/history/${track.id}`, { method: 'DELETE' });
+      const res = await authFetch(`/api/history/${track.id}`, { method: 'DELETE' });
       if (res.ok) {
         showToast('Удалено из недавних');
         setHistory((prev) => prev.filter((h) => h.id !== track.id));
@@ -419,7 +573,7 @@ export default function App() {
 
   const handleClearHistory = async () => {
     try {
-      const res = await fetch('/api/history/clear', {
+      const res = await authFetch('/api/history/clear', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: user.id }),
@@ -455,7 +609,7 @@ export default function App() {
               audioRef.current.duration &&
               !isNaN(audioRef.current.duration) &&
               isFinite(audioRef.current.duration) &&
-              audioRef.current.duration > 40
+              audioRef.current.duration > 0
             ) {
               setDuration(audioRef.current.duration);
             }
@@ -468,21 +622,11 @@ export default function App() {
             isFinite(audioRef.current.duration) &&
             audioRef.current.duration > 0
           ) {
-            if (
-              audioRef.current.duration > 40 ||
-              !playingTrack?.duration ||
-              playingTrack.duration <= 30
-            ) {
-              setDuration(audioRef.current.duration);
-            }
+            setDuration(audioRef.current.duration);
           }
         }}
         onEnded={() => {
-          if (currentTime >= duration - 2 || duration <= 30) {
-            handleNextTrack();
-          } else {
-            audioRef.current?.play().catch(() => {});
-          }
+          handleNextTrack();
         }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
@@ -499,7 +643,10 @@ export default function App() {
         onLogout={handleLogout}
         isInsideTelegram={isInsideTelegram}
         isLoggedIn={isLoggedIn}
-        onOpenLogin={() => setIsAuthModalOpen(true)}
+        onOpenLogin={() => {
+          setAuthModalMessage(null);
+          setIsAuthModalOpen(true);
+        }}
       />
 
       {/* Main Tab Content - expanded responsive layout for PC & mobile */}
@@ -537,6 +684,11 @@ export default function App() {
             }
             onGoToSearch={() => setActiveTab('search')}
             triggerHaptic={triggerHaptic}
+            isLoggedIn={isLoggedIn}
+            onOpenLogin={() => {
+              setAuthModalMessage('Войдите через Telegram для добавления треков в любимые');
+              setIsAuthModalOpen(true);
+            }}
           />
         )}
 
@@ -554,6 +706,11 @@ export default function App() {
             triggerHaptic={triggerHaptic}
             favorites={favorites}
             onToggleFavorite={handleToggleFavorite}
+            isLoggedIn={isLoggedIn}
+            onOpenLogin={() => {
+              setAuthModalMessage('Войдите через Telegram для скачивания треков в чат');
+              setIsAuthModalOpen(true);
+            }}
           />
         )}
       </main>
@@ -624,9 +781,19 @@ export default function App() {
         historyCount={history.length}
       />
 
-      {/* Telegram Mandatory Authentication Modal (Matching user screenshot image.png) */}
+      {/* Telegram & PC Code Authentication Modal */}
       <TelegramAuthModal
         isOpen={isAuthModalOpen}
+        message={authModalMessage}
+        botUsername={botConfig?.botUsername}
+        onClose={() => {
+          setIsAuthModalOpen(false);
+          setAuthModalMessage(null);
+        }}
+        onSuccess={(authProfile, token) => {
+          saveAuthSession(authProfile, token);
+          showToast(`Добро пожаловать, ${authProfile.first_name || 'Пользователь'}!`, 'success');
+        }}
         error={authError}
         triggerHaptic={triggerHaptic}
       />
